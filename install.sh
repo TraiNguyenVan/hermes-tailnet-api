@@ -1,7 +1,8 @@
 #!/bin/sh
 # hermes-tailnet-api — one-shot installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/main/install.sh | sh
+# (jsDelivr, not raw.githubusercontent — raw serves stale bytes for minutes)
+#   curl -fsSL https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@main/install.sh | sh
 #   ./install.sh                      (from a clone or unpacked copy)
 #
 # Env: HERMES_API_BASE, HERMES_API_KEY (both else prompted),
@@ -10,7 +11,7 @@ set -eu
 
 NAME=hermes-tailnet-api
 DEST="${HERMES_SKILL_DIR:-$HOME/.agents/skills/$NAME}"
-PKG_URL="${HERMES_PKG_URL:-https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/main}"
+PKG_URL="${HERMES_PKG_URL:-https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@main}"
 
 FILE_DIR=""
 for cand in "$(dirname "$0")" "."; do

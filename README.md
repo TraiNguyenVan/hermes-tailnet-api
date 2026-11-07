@@ -17,7 +17,7 @@ npx skills add TraiNguyenVan/hermes-tailnet-api -g -a '*' -y
 or without node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/main/install.sh | sh
+curl -fsSL https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@main/install.sh | sh
 ```
 
 `setup.sh` prompts for the server URL and the API key, writes
@@ -37,7 +37,7 @@ hermes-api steer <run_id> "skip the DNS check"
 ## Upgrade
 
 ```bash
-npx skills update -g -y                          # skills.sh installs
+npx skills update hermes-tailnet-api -g -y       # skills.sh installs (name it explicitly)
 ./install.sh                                     # bootstrap installs (idempotent)
 hermes-api version                               # confirm CLI version + base
 ```
