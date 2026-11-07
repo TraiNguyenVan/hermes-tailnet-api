@@ -1,7 +1,7 @@
 ---
 name: hermes-tailnet-api
 description: "Use when you must run work on a remote Hermes agent host: shell, files, browser."
-version: 1.0.6
+version: 1.1.0
 author: TraiNguyenVan
 license: MIT
 platforms: [linux, darwin]
@@ -23,6 +23,8 @@ It is an agent loop, not a model endpoint — never point a model `base_url` at 
 ```bash
 scripts/setup.sh          # prompts for server URL + API key, checks connectivity
 hermes-api version        # CLI version + configured base
+hermes-api health         # server health + readiness checks
+hermes-api tools          # see available tools on remote host (terminal, browser, etc.)
 hermes-api models         # must print {"object": "list", ...}
 ```
 
@@ -31,16 +33,43 @@ hermes-api models         # must print {"object": "list", ...}
 | Command | Use |
 |---|---|
 | `hermes-api ask "do X"` | synchronous, prints the answer (short replies) |
+| `hermes-api ask --stream "do X"` | stream tokens live to stdout |
 | `hermes-api run "do X"` | async, prints a `run_id` immediately |
 | `hermes-api wait RUN_ID` | poll until finished, print output |
 | `hermes-api get RUN_ID` | one status snapshot (JSON) |
 | `hermes-api events RUN_ID` | stream live tool-progress SSE |
 | `hermes-api steer RUN_ID "change course"` | inject guidance at the next tool boundary |
+| `hermes-api approve RUN_ID [allow\|deny]` | resolve pending tool approval prompt |
 | `hermes-api stop RUN_ID` | interrupt the run |
+| `hermes-api tools` | list enabled/disabled tools on remote agent |
+| `hermes-api health` | check server and platform readiness |
 | `hermes-api models` / `version` | connectivity+auth check / config check |
 
-Flags on `ask`/`run`: `--session <id>` (continue a conversation), `--model <id>`,
-`--profile <name>` (route to another gateway profile).
+Flags on `ask`/`run`:
+- `-f, --file PATH`: attach a text, code, or diff file (repeatable).
+- `-i, --image PATH`: attach an image file (auto-encoded to base64 data URL).
+- `--extract-media [DIR]`: auto-save returned image artifacts to local files.
+- `--session <id>`: continue an existing session conversation.
+- `--model <id>`: use a specific model route.
+- `--profile <name>`: route to another gateway profile.
+- `-`: read prompt / patch from standard input.
+
+## Examples
+
+```bash
+# Pipe code or diff directly from git
+git diff | hermes-api ask - "review this diff for race conditions"
+
+# Attach files to review or process
+hermes-api ask -f main.py -f config.py "spot configuration bugs"
+
+# Attach an image for multimodal vision analysis
+hermes-api ask -i diagram.png "explain architecture in this diagram"
+
+# Asynchronous run with media artifact extraction
+RUN_ID=$(hermes-api run -f test.log "analyze crash and plot memory profile")
+hermes-api wait $RUN_ID --extract-media ./artifacts
+```
 
 ## Working rules
 

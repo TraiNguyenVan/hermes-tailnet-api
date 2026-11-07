@@ -17,7 +17,7 @@ npx skills add TraiNguyenVan/hermes-tailnet-api -g -a '*' -y
 or without node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.0.6/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.1.0/install.sh | sh
 ```
 
 `setup.sh` prompts for the server URL and the API key, writes
@@ -27,11 +27,24 @@ curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1
 ## Use
 
 ```bash
+# Basic ask & run
 hermes-api ask "restart the postgres container"
+hermes-api ask --stream "explain network config"
 hermes-api run "audit open ports"      # prints run_id
 hermes-api wait <run_id>
 hermes-api events <run_id>
 hermes-api steer <run_id> "skip the DNS check"
+hermes-api approve <run_id> allow
+
+# Attach files & images
+git diff | hermes-api ask - "review this diff"
+hermes-api ask -f main.py "find concurrency bugs"
+hermes-api run -i diagram.png "analyze architecture diagram"
+hermes-api wait <run_id> --extract-media ./downloads
+
+# Server & tool introspection
+hermes-api health                      # check platform & readiness status
+hermes-api tools                       # inspect enabled tools on remote host
 ```
 
 ## Upgrade
@@ -54,8 +67,8 @@ hermes-api version                               # confirm CLI version + base
   `~/.config/hermes/api.env` with mode `600` on your machine only.
 - The remote agent runs with the permissions of the Hermes host. Ask its operator
   what it may touch before delegating destructive work.
-- Read `scripts/hermes-api` before running it — it is ~250 lines of stdlib
-  `urllib`, no dependencies, no telemetry.
+- Read `scripts/hermes-api` before running it — it is clean stdlib `urllib`,
+  no dependencies, no telemetry.
 
 ## Contents
 
@@ -66,5 +79,6 @@ hermes-api version                               # confirm CLI version + base
 | `scripts/setup.sh` | link CLI + write credentials + verify |
 | `install.sh` | bootstrap installer (pipe-friendly) |
 | `references/api.md` | endpoint cheat sheet |
+| `tests/test_cli.py` | unit tests for argument parsing and media handling |
 
 MIT licensed.

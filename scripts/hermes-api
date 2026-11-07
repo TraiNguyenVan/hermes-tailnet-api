@@ -4,15 +4,32 @@
 Lets a coding agent (Claude Code, Codex, OpenCode, any shell) drive Hermes over
 the tailnet without knowing the HTTP details.
 
+Basic:
   hermes-api ask  "do X"                 # synchronous completion, prints the answer
+  hermes-api ask  --stream "do X"        # stream tokens live to stdout
   hermes-api run  "do X"                 # async run, prints run_id immediately
   hermes-api wait RUN_ID                 # poll until finished, print output
   hermes-api get  RUN_ID                 # one status snapshot (JSON)
   hermes-api events RUN_ID               # stream live events (SSE)
   hermes-api steer RUN_ID "change course"
+  hermes-api approve RUN_ID [allow|deny] # resolve pending tool approval
   hermes-api stop RUN_ID
-  hermes-api models
-  hermes-api version                  # CLI version + configured base
+  hermes-api tools                       # list available remote toolsets
+  hermes-api health                      # server health and readiness checks
+  hermes-api models                      # list available models
+  hermes-api version                     # CLI version + configured base
+
+Attachments & Input:
+  -f, --file PATH       Attach a text/code/diff file (can be repeated)
+  -i, --image PATH      Attach an image file (auto-encoded to base64 data URL)
+  --extract-media [DIR] Extract returned image artifacts to local files
+  -                     Read prompt / diff from stdin (pipe-friendly)
+
+Examples:
+  cat error.log | hermes-api ask - "what caused this error?"
+  hermes-api ask -f diff.patch "review this diff against best practices"
+  hermes-api run -i diagram.png "explain architecture in diagram"
+  hermes-api wait <run_id> --extract-media ./downloads
 
 Env:
   HERMES_API_BASE   required, e.g. http://<host>:<port>/v1  (see setup.sh)
@@ -21,17 +38,19 @@ Env:
 """
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 
 DEFAULT_BASE = os.environ.get("HERMES_API_BASE", "")
-__version__ = "1.0.6"
+__version__ = "1.1.0"
 DEFAULT_MODEL = os.environ.get("HERMES_API_MODEL", "hermes-agent")
-
 
 ENV_CANDIDATES = (
     "~/.config/hermes/api.env",          # written by install.sh
@@ -88,9 +107,19 @@ def base_url() -> str:
     return base
 
 
+def server_root_url() -> str:
+    b = base_url()
+    if "/v1" in b:
+        return b[:b.index("/v1")]
+    return b
+
+
 def call(method: str, path: str, body: dict | None = None, stream: bool = False,
          timeout: float = 900.0):
-    url = base_url() + path
+    if path.startswith("/health/detailed"):
+        url = server_root_url() + path
+    else:
+        url = base_url() + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Bearer {api_key()}")
@@ -98,7 +127,7 @@ def call(method: str, path: str, body: dict | None = None, stream: bool = False,
     req.add_header("Accept", "text/event-stream" if stream else "application/json")
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
-    except urllib.error.HTTPError as exc:  # surface the server's message, not a traceback
+    except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:1000]
         sys.exit(f"hermes-api: HTTP {exc.code} — {detail}")
     except urllib.error.URLError as exc:
@@ -110,37 +139,194 @@ def jbody(resp) -> dict:
     return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def cmd_ask(args: list[str]) -> None:
-    prompt, session, model = parse_run_args(args)
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False}
-    msg = jbody(call("POST", "/chat/completions", body))["choices"][0]["message"]["content"]
-    print(msg)
+def encode_image_file(path: str) -> str:
+    """Read local image file and format as data URL."""
+    p = os.path.expanduser(path)
+    if not os.path.isfile(p):
+        sys.exit(f"hermes-api: image file not found: {path}")
+    mime, _ = mimetypes.guess_type(p)
+    if not mime or not mime.startswith("image/"):
+        ext = os.path.splitext(p)[1].lower().lstrip(".")
+        mime = f"image/{ext}" if ext in ("png", "jpeg", "jpg", "webp", "gif") else "image/png"
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    with open(p, "rb") as f:
+        data = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{data}"
+
+
+def read_text_attachment(path: str) -> dict:
+    """Read a local text file for inclusion as an attachment."""
+    p = os.path.expanduser(path)
+    if not os.path.isfile(p):
+        sys.exit(f"hermes-api: file not found: {path}")
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as exc:
+        sys.exit(f"hermes-api: cannot read file {path}: {exc}")
+    return {"path": path, "name": os.path.basename(p), "content": content}
+
+
+def build_combined_user_message(prompt: str, files: list[dict], images: list[str]) -> str:
+    """Combine text prompt with attached file contents and image data tags."""
+    sections = []
+    if prompt and prompt != "-":
+        sections.append(prompt)
+    for f in files:
+        sections.append(f"\n--- Attachment: {f['name']} ({len(f['content'])} chars) ---\n{f['content']}\n--- End Attachment: {f['name']} ---")
+    for img in images:
+        sections.append(f"\n![image]({img})")
+    return "\n".join(sections).strip()
+
+
+def extract_media_from_text(text: str, output_dir: str = ".") -> list[str]:
+    """Find data:image base64 URLs in text and write them to output_dir."""
+    saved = []
+    pattern = re.compile(r'!\[([^\]]*)\]\(data:(image\/[a-zA-Z0-9.-]+);base64,([A-Za-z0-9+/=]+)\)')
+    os.makedirs(output_dir, exist_ok=True)
+    idx = 1
+    for m in pattern.finditer(text):
+        label, mime, b64_data = m.groups()
+        ext = mime.split("/")[-1].replace("jpeg", "jpg")
+        clean_label = re.sub(r'[^a-zA-Z0-9_-]', '_', label).strip('_')
+        fname = f"{clean_label or 'extracted'}_{idx}.{ext}"
+        dest = os.path.join(output_dir, fname)
+        try:
+            with open(dest, "wb") as f:
+                f.write(base64.b64decode(b64_data))
+            saved.append(dest)
+            idx += 1
+        except Exception as exc:
+            print(f"hermes-api: failed to save {dest}: {exc}", file=sys.stderr)
+    return saved
+
+
+def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dict], list[str], bool, str | None]:
+    session = None
+    model = DEFAULT_MODEL
+    stream = False
+    extract_media: str | None = None
+    files: list[dict] = []
+    images: list[str] = []
+    rest: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-f", "--file"):
+            if i + 1 >= len(args):
+                sys.exit("hermes-api: missing argument for " + arg)
+            files.append(read_text_attachment(args[i + 1]))
+            i += 2
+        elif arg in ("-i", "--image"):
+            if i + 1 >= len(args):
+                sys.exit("hermes-api: missing argument for " + arg)
+            images.append(encode_image_file(args[i + 1]))
+            i += 2
+        elif arg == "--extract-media":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                extract_media = args[i + 1]
+                i += 2
+            else:
+                extract_media = "."
+                i += 1
+        elif arg == "--session":
+            if i + 1 >= len(args):
+                sys.exit("hermes-api: missing argument for --session")
+            session = args[i + 1]
+            i += 2
+        elif arg == "--model":
+            if i + 1 >= len(args):
+                sys.exit("hermes-api: missing argument for --model")
+            model = args[i + 1]
+            i += 2
+        elif arg == "--profile":
+            if i + 1 >= len(args):
+                sys.exit("hermes-api: missing argument for --profile")
+            model = f"p/{args[i + 1]}/{DEFAULT_MODEL}"
+            i += 2
+        elif arg == "--stream":
+            stream = True
+            i += 1
+        else:
+            rest.append(arg)
+            i += 1
+
+    prompt = " ".join(rest)
+    if prompt == "-" or (not prompt and not sys.stdin.isatty()):
+        stdin_content = sys.stdin.read()
+        prompt = stdin_content if not prompt or prompt == "-" else f"{prompt}\n\n{stdin_content}"
+
+    if not prompt and not files and not images:
+        sys.exit("hermes-api: missing prompt or attachment")
+
+    return prompt, session, model, files, images, stream, extract_media
 
 
 def parse_run_args(args: list[str]) -> tuple[str, str | None, str]:
-    session = None
-    model = DEFAULT_MODEL
-    rest = list(args)
-    if "--session" in rest:
-        i = rest.index("--session")
-        session = rest[i + 1]
-        del rest[i:i + 2]
-    if "--model" in rest:
-        i = rest.index("--model")
-        model = rest[i + 1]
-        del rest[i:i + 2]
-    if "--profile" in rest:
-        i = rest.index("--profile")
-        model = f"p/{rest[i + 1]}/{DEFAULT_MODEL}"
-        del rest[i:i + 2]
-    if not rest:
-        sys.exit("hermes-api: missing prompt")
-    return " ".join(rest), session, model
+    prompt, session, model, files, images, _, _ = parse_extended_args(args)
+    combined = build_combined_user_message(prompt, files, images)
+    return combined, session, model
+
+
+def cmd_ask(args: list[str]) -> None:
+    prompt, session, model, files, images, stream, extract_media = parse_extended_args(args)
+    full_prompt = build_combined_user_message(prompt, files, images)
+
+    # Use multimodal array if images attached and no text file attachments
+    if images and not files:
+        user_content: list[dict] | str = [{"type": "text", "text": prompt or "Process attached image."}]
+        for img in images:
+            user_content.append({"type": "image_url", "image_url": {"url": img}})
+    else:
+        user_content = full_prompt
+
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "stream": stream,
+    }
+
+    if not stream:
+        resp = jbody(call("POST", "/chat/completions", body))
+        content = resp["choices"][0]["message"]["content"]
+        print(content)
+        if extract_media:
+            saved = extract_media_from_text(content, output_dir=extract_media)
+            if saved:
+                print(f"[media saved: {', '.join(saved)}]")
+    else:
+        resp = call("POST", "/chat/completions", body, stream=True)
+        chunks = []
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data: "):
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk["choices"][0]["delta"].get("content") or ""
+                    chunks.append(delta)
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+        print()
+        if extract_media:
+            full_text = "".join(chunks)
+            saved = extract_media_from_text(full_text, output_dir=extract_media)
+            if saved:
+                print(f"[media saved: {', '.join(saved)}]")
 
 
 def cmd_run(args: list[str]) -> None:
-    prompt, session, model = parse_run_args(args)
-    body: dict = {"input": prompt, "model": model}
+    prompt, session, model, files, images, _, _ = parse_extended_args(args)
+    combined = build_combined_user_message(prompt, files, images)
+    body: dict = {"input": combined, "model": model}
     if session:
         body["session_id"] = session
     out = jbody(call("POST", "/runs", body))
@@ -152,7 +338,14 @@ def cmd_get(run_id: str) -> None:
     print(json.dumps(jbody(call("GET", f"/runs/{run_id}")), indent=2)[:4000])
 
 
-def cmd_wait(run_id: str, timeout_s: float = 900.0) -> None:
+def cmd_wait(args: list[str], timeout_s: float = 900.0) -> None:
+    if not args:
+        sys.exit("hermes-api: missing RUN_ID")
+    run_id = args[0]
+    extract_media: str | None = None
+    if len(args) > 1 and args[1] == "--extract-media":
+        extract_media = args[2] if len(args) > 2 else "."
+
     deadline = time.time() + timeout_s
     while True:
         snap = jbody(call("GET", f"/runs/{run_id}"))
@@ -162,6 +355,10 @@ def cmd_wait(run_id: str, timeout_s: float = 900.0) -> None:
             if isinstance(out, (dict, list)):
                 out = json.dumps(out)[:8000]
             print(f"[{status}] {out}")
+            if extract_media and isinstance(out, str):
+                saved = extract_media_from_text(out, output_dir=extract_media)
+                if saved:
+                    print(f"[media saved: {', '.join(saved)}]")
             sys.exit(0 if status.startswith(("succ", "comp", "done")) else 1)
         if time.time() > deadline:
             sys.exit(f"hermes-api: timed out waiting on {run_id} (status={status})")
@@ -180,8 +377,40 @@ def cmd_steer(run_id: str, message: str) -> None:
     print(json.dumps(jbody(call("POST", f"/runs/{run_id}/steer", {"message": message})), indent=2)[:2000])
 
 
+def cmd_approve(args: list[str]) -> None:
+    if not args:
+        sys.exit("hermes-api: usage: hermes-api approve RUN_ID [allow|deny]")
+    run_id = args[0]
+    decision = "allow"
+    if len(args) > 1 and args[1].lower() in ("deny", "reject", "no"):
+        decision = "deny"
+    body = {"decision": decision}
+    print(json.dumps(jbody(call("POST", f"/runs/{run_id}/approval", body)), indent=2)[:2000])
+
+
 def cmd_stop(run_id: str) -> None:
     print(json.dumps(jbody(call("POST", f"/runs/{run_id}/stop", {})), indent=2)[:2000])
+
+
+def cmd_tools() -> None:
+    data = jbody(call("GET", "/toolsets")).get("data", [])
+    print(f"{'Tool Name':<20} {'Status':<10} {'Tools':<50}")
+    print("-" * 80)
+    for t in data:
+        status = "enabled" if t.get("enabled") else "disabled"
+        tools_str = ", ".join(t.get("tools", []))[:48]
+        print(f"{t.get('name', ''):<20} {status:<10} {tools_str:<50}")
+
+
+def cmd_health() -> None:
+    h = jbody(call("GET", "/health"))
+    d = jbody(call("GET", "/health/detailed"))
+    print(f"Platform: {h.get('platform')}  v{h.get('version')}  Status: {h.get('status')}")
+    readiness = d.get("readiness", {}).get("checks", {})
+    for check, detail in readiness.items():
+        st = detail.get("status", "unknown")
+        extra = f" (used: {detail.get('used_percent')}%)" if "used_percent" in detail else ""
+        print(f"  [{st.upper():<4}] {check}{extra}")
 
 
 def cmd_version() -> None:
@@ -206,15 +435,21 @@ def main(argv: list[str]) -> None:
     elif verb == "run":
         cmd_run(args)
     elif verb == "wait":
-        cmd_wait(args[0])
+        cmd_wait(args)
     elif verb == "get":
         cmd_get(args[0])
     elif verb == "events":
         cmd_events(args[0])
     elif verb == "steer":
         cmd_steer(args[0], " ".join(args[1:]))
+    elif verb == "approve":
+        cmd_approve(args)
     elif verb == "stop":
         cmd_stop(args[0])
+    elif verb == "tools":
+        cmd_tools()
+    elif verb == "health":
+        cmd_health()
     elif verb == "models":
         cmd_models()
     elif verb == "version":
@@ -224,4 +459,12 @@ def main(argv: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    try:
+        main(sys.argv)
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+

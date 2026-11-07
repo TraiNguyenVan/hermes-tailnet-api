@@ -10,7 +10,7 @@ set -eu
 
 NAME=hermes-tailnet-api
 DEST="${HERMES_SKILL_DIR:-$HOME/.agents/skills/$NAME}"
-VERSION="1.0.6"
+VERSION="1.1.0"
 # Payload comes from the immutable tag matching THIS installer, from two CDNs.
 # Never fall back to a branch ref: @main serves stale, per-file, mixed versions
 # for minutes to hours, which silently installs a mismatched skill.
