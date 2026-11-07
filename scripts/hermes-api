@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_BASE = os.environ.get("HERMES_API_BASE", "")
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 DEFAULT_MODEL = os.environ.get("HERMES_API_MODEL", "hermes-agent")
 
 
