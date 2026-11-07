@@ -1,7 +1,7 @@
 ---
 name: hermes-tailnet-api
 description: "Use when you must run work on a remote Hermes agent host: shell, files, browser."
-version: 1.0.1
+version: 1.0.2
 author: TraiNguyenVan
 license: MIT
 platforms: [linux, darwin]
