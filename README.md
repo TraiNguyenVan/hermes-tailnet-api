@@ -17,7 +17,7 @@ npx skills add TraiNguyenVan/hermes-tailnet-api -g -a '*' -y
 or without node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.1.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.2.0/install.sh | sh
 ```
 
 `setup.sh` prompts for the server URL and the API key, writes
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1
 hermes-api ask "restart the postgres container"
 hermes-api ask --stream "explain network config"
 hermes-api run "audit open ports"      # prints run_id
-hermes-api wait <run_id>
+hermes-api wait <run_id> --stop-on-interrupt
 hermes-api events <run_id>
 hermes-api steer <run_id> "skip the DNS check"
 hermes-api approve <run_id> allow
@@ -42,7 +42,10 @@ hermes-api ask -f main.py "find concurrency bugs"
 hermes-api run -i diagram.png "analyze architecture diagram"
 hermes-api wait <run_id> --extract-media ./downloads
 
-# Server & tool introspection
+# Discovery & introspection
+hermes-api sessions                    # list active conversation sessions
+hermes-api runs                        # list runs (checks capability)
+hermes-api capabilities                # inspect remote gateway routes & features
 hermes-api health                      # check platform & readiness status
 hermes-api tools                       # inspect enabled tools on remote host
 ```

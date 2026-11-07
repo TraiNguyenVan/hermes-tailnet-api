@@ -14,7 +14,7 @@ loader.exec_module(hermes_api)
 
 class TestHermesAPI(unittest.TestCase):
     def test_parse_extended_args_simple(self):
-        prompt, session, model, files, images, stream, extract_media = hermes_api.parse_extended_args(["do", "something"])
+        prompt, session, model, files, images, stream, extract_media, stop_on_interrupt = hermes_api.parse_extended_args(["do", "something"])
         self.assertEqual(prompt, "do something")
         self.assertIsNone(session)
         self.assertEqual(model, "hermes-agent")
@@ -22,19 +22,21 @@ class TestHermesAPI(unittest.TestCase):
         self.assertEqual(images, [])
         self.assertFalse(stream)
         self.assertIsNone(extract_media)
+        self.assertFalse(stop_on_interrupt)
 
     def test_parse_extended_args_with_files_and_stream(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write("test content\nline 2")
             tf_path = tf.name
         try:
-            prompt, session, model, files, images, stream, extract_media = hermes_api.parse_extended_args([
-                "review", "-f", tf_path, "--stream", "--session", "sess_1", "--extract-media", "/tmp/out"
+            prompt, session, model, files, images, stream, extract_media, stop_on_interrupt = hermes_api.parse_extended_args([
+                "review", "-f", tf_path, "--stream", "--session", "sess_1", "--extract-media", "/tmp/out", "--stop-on-interrupt"
             ])
             self.assertEqual(prompt, "review")
             self.assertEqual(session, "sess_1")
             self.assertTrue(stream)
             self.assertEqual(extract_media, "/tmp/out")
+            self.assertTrue(stop_on_interrupt)
             self.assertEqual(len(files), 1)
             self.assertEqual(files[0]["content"], "test content\nline 2")
         finally:
@@ -71,6 +73,20 @@ class TestHermesAPI(unittest.TestCase):
         self.assertIn("print('hello')", msg)
         self.assertIn("![image](data:image/png;base64,AAAA)", msg)
 
+    def test_read_text_attachment_validates_size(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("small text")
+            tf_path = tf.name
+        try:
+            att = hermes_api.read_text_attachment(tf_path)
+            self.assertEqual(att["name"], os.path.basename(tf_path))
+            self.assertEqual(att["content"], "small text")
+        finally:
+            os.remove(tf_path)
+
+    def test_read_text_attachment_rejects_missing(self):
+        with self.assertRaises(SystemExit):
+            hermes_api.read_text_attachment("/nonexistent/file/path.txt")
+
 if __name__ == "__main__":
     unittest.main()
-

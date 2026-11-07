@@ -14,7 +14,10 @@ Basic:
   hermes-api steer RUN_ID "change course"
   hermes-api approve RUN_ID [allow|deny] # resolve pending tool approval
   hermes-api stop RUN_ID
+  hermes-api runs                        # list runs (checks capability)
+  hermes-api sessions                    # list active conversation sessions
   hermes-api tools                       # list available remote toolsets
+  hermes-api capabilities                # inspect server feature flags & routes
   hermes-api health                      # server health and readiness checks
   hermes-api models                      # list available models
   hermes-api version                     # CLI version + configured base
@@ -23,6 +26,7 @@ Attachments & Input:
   -f, --file PATH       Attach a text/code/diff file (can be repeated)
   -i, --image PATH      Attach an image file (auto-encoded to base64 data URL)
   --extract-media [DIR] Extract returned image artifacts to local files
+  --stop-on-interrupt   On Ctrl-C in wait, automatically stop the remote run
   -                     Read prompt / diff from stdin (pipe-friendly)
 
 Examples:
@@ -30,6 +34,7 @@ Examples:
   hermes-api ask -f diff.patch "review this diff against best practices"
   hermes-api run -i diagram.png "explain architecture in diagram"
   hermes-api wait <run_id> --extract-media ./downloads
+  hermes-api sessions
 
 Env:
   HERMES_API_BASE   required, e.g. http://<host>:<port>/v1  (see setup.sh)
@@ -39,6 +44,7 @@ Env:
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import mimetypes
 import os
@@ -49,8 +55,12 @@ import urllib.error
 import urllib.request
 
 DEFAULT_BASE = os.environ.get("HERMES_API_BASE", "")
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 DEFAULT_MODEL = os.environ.get("HERMES_API_MODEL", "hermes-agent")
+
+MAX_TEXT_ATTACHMENT_BYTES = 25 * 1024 * 1024   # 25 MB
+MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB
+WARN_ATTACHMENT_BYTES = 1024 * 1024            # 1 MB
 
 ENV_CANDIDATES = (
     "~/.config/hermes/api.env",          # written by install.sh
@@ -116,7 +126,7 @@ def server_root_url() -> str:
 
 def call(method: str, path: str, body: dict | None = None, stream: bool = False,
          timeout: float = 900.0):
-    if path.startswith("/health/detailed"):
+    if path.startswith(("/health/detailed", "/api/")):
         url = server_root_url() + path
     else:
         url = base_url() + path
@@ -140,10 +150,15 @@ def jbody(resp) -> dict:
 
 
 def encode_image_file(path: str) -> str:
-    """Read local image file and format as data URL."""
+    """Read local image file and format as data URL with size validation."""
     p = os.path.expanduser(path)
     if not os.path.isfile(p):
         sys.exit(f"hermes-api: image file not found: {path}")
+    size = os.path.getsize(p)
+    if size > MAX_IMAGE_ATTACHMENT_BYTES:
+        sys.exit(f"hermes-api: image file exceeds {MAX_IMAGE_ATTACHMENT_BYTES // (1024*1024)}MB limit: {path} ({size} bytes)")
+    if size > WARN_ATTACHMENT_BYTES:
+        print(f"hermes-api: warning: large image attachment ({size // 1024} KB): {path}", file=sys.stderr)
     mime, _ = mimetypes.guess_type(p)
     if not mime or not mime.startswith("image/"):
         ext = os.path.splitext(p)[1].lower().lstrip(".")
@@ -152,19 +167,26 @@ def encode_image_file(path: str) -> str:
         mime = "image/jpeg"
     with open(p, "rb") as f:
         data = base64.b64encode(f.read()).decode("ascii")
+    print(f"[attached image: {path} ({size} bytes, {mime})]", file=sys.stderr)
     return f"data:{mime};base64,{data}"
 
 
 def read_text_attachment(path: str) -> dict:
-    """Read a local text file for inclusion as an attachment."""
+    """Read a local text file for inclusion as an attachment with size validation."""
     p = os.path.expanduser(path)
     if not os.path.isfile(p):
         sys.exit(f"hermes-api: file not found: {path}")
+    size = os.path.getsize(p)
+    if size > MAX_TEXT_ATTACHMENT_BYTES:
+        sys.exit(f"hermes-api: file exceeds {MAX_TEXT_ATTACHMENT_BYTES // (1024*1024)}MB limit: {path} ({size} bytes)")
+    if size > WARN_ATTACHMENT_BYTES:
+        print(f"hermes-api: warning: large text attachment ({size // 1024} KB): {path}", file=sys.stderr)
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except OSError as exc:
         sys.exit(f"hermes-api: cannot read file {path}: {exc}")
+    print(f"[attached file: {path} ({size} bytes)]", file=sys.stderr)
     return {"path": path, "name": os.path.basename(p), "content": content}
 
 
@@ -202,10 +224,11 @@ def extract_media_from_text(text: str, output_dir: str = ".") -> list[str]:
     return saved
 
 
-def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dict], list[str], bool, str | None]:
+def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dict], list[str], bool, str | None, bool]:
     session = None
     model = DEFAULT_MODEL
     stream = False
+    stop_on_interrupt = False
     extract_media: str | None = None
     files: list[dict] = []
     images: list[str] = []
@@ -231,6 +254,9 @@ def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dic
             else:
                 extract_media = "."
                 i += 1
+        elif arg == "--stop-on-interrupt":
+            stop_on_interrupt = True
+            i += 1
         elif arg == "--session":
             if i + 1 >= len(args):
                 sys.exit("hermes-api: missing argument for --session")
@@ -261,20 +287,19 @@ def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dic
     if not prompt and not files and not images:
         sys.exit("hermes-api: missing prompt or attachment")
 
-    return prompt, session, model, files, images, stream, extract_media
+    return prompt, session, model, files, images, stream, extract_media, stop_on_interrupt
 
 
 def parse_run_args(args: list[str]) -> tuple[str, str | None, str]:
-    prompt, session, model, files, images, _, _ = parse_extended_args(args)
+    prompt, session, model, files, images, _, _, _ = parse_extended_args(args)
     combined = build_combined_user_message(prompt, files, images)
     return combined, session, model
 
 
 def cmd_ask(args: list[str]) -> None:
-    prompt, session, model, files, images, stream, extract_media = parse_extended_args(args)
+    prompt, session, model, files, images, stream, extract_media, _ = parse_extended_args(args)
     full_prompt = build_combined_user_message(prompt, files, images)
 
-    # Use multimodal array if images attached and no text file attachments
     if images and not files:
         user_content: list[dict] | str = [{"type": "text", "text": prompt or "Process attached image."}]
         for img in images:
@@ -324,7 +349,7 @@ def cmd_ask(args: list[str]) -> None:
 
 
 def cmd_run(args: list[str]) -> None:
-    prompt, session, model, files, images, _, _ = parse_extended_args(args)
+    prompt, session, model, files, images, _, _, _ = parse_extended_args(args)
     combined = build_combined_user_message(prompt, files, images)
     body: dict = {"input": combined, "model": model}
     if session:
@@ -340,29 +365,64 @@ def cmd_get(run_id: str) -> None:
 
 def cmd_wait(args: list[str], timeout_s: float = 900.0) -> None:
     if not args:
-        sys.exit("hermes-api: missing RUN_ID")
+        sys.exit("hermes-api: missing RUN_ID\nUsage: hermes-api wait RUN_ID [--extract-media DIR] [--stop-on-interrupt]")
     run_id = args[0]
     extract_media: str | None = None
-    if len(args) > 1 and args[1] == "--extract-media":
-        extract_media = args[2] if len(args) > 2 else "."
+    stop_on_interrupt = False
 
-    deadline = time.time() + timeout_s
-    while True:
-        snap = jbody(call("GET", f"/runs/{run_id}"))
-        status = str(snap.get("status", "")).lower()
-        if status in {"succeeded", "success", "completed", "done", "failed", "error", "cancelled", "stopped"}:
-            out = snap.get("output") or snap.get("result") or snap.get("response") or ""
-            if isinstance(out, (dict, list)):
-                out = json.dumps(out)[:8000]
-            print(f"[{status}] {out}")
-            if extract_media and isinstance(out, str):
-                saved = extract_media_from_text(out, output_dir=extract_media)
-                if saved:
-                    print(f"[media saved: {', '.join(saved)}]")
-            sys.exit(0 if status.startswith(("succ", "comp", "done")) else 1)
-        if time.time() > deadline:
-            sys.exit(f"hermes-api: timed out waiting on {run_id} (status={status})")
-        time.sleep(2)
+    i = 1
+    while i < len(args):
+        if args[i] == "--extract-media":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                extract_media = args[i + 1]
+                i += 2
+            else:
+                extract_media = "."
+                i += 1
+        elif args[i] == "--stop-on-interrupt":
+            stop_on_interrupt = True
+            i += 1
+        else:
+            i += 1
+
+    start_time = time.time()
+    deadline = start_time + timeout_s
+    last_status = "pending"
+    try:
+        while True:
+            snap = jbody(call("GET", f"/runs/{run_id}"))
+            status = str(snap.get("status", "")).lower()
+            last_status = status
+            if status in {"succeeded", "success", "completed", "done", "failed", "error", "cancelled", "stopped"}:
+                elapsed = int(time.time() - start_time)
+                out = snap.get("output") or snap.get("result") or snap.get("response") or ""
+                if isinstance(out, (dict, list)):
+                    out = json.dumps(out)[:8000]
+                print(f"[{status} in {elapsed}s] {out}")
+                if extract_media and isinstance(out, str):
+                    saved = extract_media_from_text(out, output_dir=extract_media)
+                    if saved:
+                        print(f"[media saved: {', '.join(saved)}]")
+                sys.exit(0 if status.startswith(("succ", "comp", "done")) else 1)
+
+            elapsed = int(time.time() - start_time)
+            print(f"\r[waiting on {run_id}... {elapsed}s (status: {status})]", end="", file=sys.stderr, flush=True)
+
+            if time.time() > deadline:
+                print(file=sys.stderr)
+                sys.exit(f"hermes-api: timed out waiting on {run_id} (status={status})")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        if stop_on_interrupt:
+            print(f"hermes-api: interrupting remote run {run_id}...", file=sys.stderr)
+            cmd_stop(run_id)
+            sys.exit(130)
+        else:
+            print(f"hermes-api: local wait interrupted. Run {run_id} continues on remote host.\n"
+                  f"  To re-attach wait: hermes-api wait {run_id}\n"
+                  f"  To stop the run:   hermes-api stop {run_id}", file=sys.stderr)
+            sys.exit(130)
 
 
 def cmd_events(run_id: str) -> None:
@@ -390,6 +450,56 @@ def cmd_approve(args: list[str]) -> None:
 
 def cmd_stop(run_id: str) -> None:
     print(json.dumps(jbody(call("POST", f"/runs/{run_id}/stop", {})), indent=2)[:2000])
+
+
+def cmd_runs() -> None:
+    """Check capabilities before attempting to list runs."""
+    cap = jbody(call("GET", "/capabilities"))
+    endpoints = cap.get("endpoints", {})
+    runs_ep = endpoints.get("runs", {})
+    has_get_runs = isinstance(runs_ep, dict) and runs_ep.get("method") == "GET"
+    if not has_get_runs and "runs_list" not in endpoints:
+        print("hermes-api: server does not expose a runs index endpoint (only POST /v1/runs and GET /v1/runs/{id} are supported).", file=sys.stderr)
+        print("Tip: use 'hermes-api sessions' to view active conversation sessions.", file=sys.stderr)
+        return
+    res = jbody(call("GET", "/runs"))
+    print(json.dumps(res, indent=2))
+
+
+def cmd_sessions() -> None:
+    """List conversation sessions from GET /api/sessions."""
+    data = jbody(call("GET", "/api/sessions")).get("data", [])
+    if not data:
+        print("No active sessions found.")
+        return
+    print(f"{'Session ID':<26} {'Msgs':<6} {'Last Active':<18} {'Title / Preview':<40}")
+    print("-" * 92)
+    for s in data:
+        sid = s.get("id", "")
+        msgs = s.get("message_count", 0)
+        la = s.get("last_active")
+        la_str = datetime.datetime.fromtimestamp(la).strftime("%Y-%m-%d %H:%M") if la else "-"
+        title = s.get("title") or s.get("preview") or "-"
+        clean_title = title.replace("\n", " ").strip()[:38]
+        print(f"{sid:<26} {msgs:<6} {la_str:<18} {clean_title:<40}")
+
+
+def cmd_capabilities() -> None:
+    """Inspect server runtime, enabled features, and route table."""
+    cap = jbody(call("GET", "/capabilities"))
+    rt = cap.get("runtime", {})
+    print(f"Platform: {cap.get('platform')}  Runtime: {rt.get('mode')}  Tool Execution: {rt.get('tool_execution')}")
+    print()
+    print("Enabled Features:")
+    for feat, enabled in cap.get("features", {}).items():
+        if enabled:
+            val = "yes" if enabled is True else str(enabled)
+            print(f"  + {feat:<28} : {val}")
+    print()
+    print("Endpoints:")
+    for name, ep in cap.get("endpoints", {}).items():
+        if isinstance(ep, dict):
+            print(f"  {ep.get('method', 'GET'):<6} {ep.get('path', ''):<32} ({name})")
 
 
 def cmd_tools() -> None:
@@ -446,6 +556,12 @@ def main(argv: list[str]) -> None:
         cmd_approve(args)
     elif verb == "stop":
         cmd_stop(args[0])
+    elif verb == "runs":
+        cmd_runs()
+    elif verb == "sessions":
+        cmd_sessions()
+    elif verb == "capabilities":
+        cmd_capabilities()
     elif verb == "tools":
         cmd_tools()
     elif verb == "health":
@@ -467,4 +583,3 @@ if __name__ == "__main__":
         sys.exit(0)
     except KeyboardInterrupt:
         sys.exit(130)
-
