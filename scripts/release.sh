@@ -15,6 +15,8 @@ cd "$DIR"
 sed -i.bak "s/^version: .*/version: $V/" SKILL.md && rm -f SKILL.md.bak
 sed -i.bak "s/^__version__ = .*/__version__ = \"$V\"/" scripts/hermes-api && rm -f scripts/hermes-api.bak
 sed -i.bak "s/^VERSION=.*/VERSION=\"$V\"/" install.sh && rm -f install.sh.bak
+# keep the README's tag-pinned bootstrap URL pointing at this release
+sed -i.bak -E "s#/hermes-tailnet-api/v[0-9.]+/install\.sh#/hermes-tailnet-api/v$V/install.sh#" README.md && rm -f README.md.bak
 
 git add -A
 git commit -qm "release: v$V"

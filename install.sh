@@ -11,7 +11,7 @@ set -eu
 
 NAME=hermes-tailnet-api
 DEST="${HERMES_SKILL_DIR:-$HOME/.agents/skills/$NAME}"
-VERSION="1.0.4"
+VERSION="1.0.5"
 # Fetch payload from the immutable tag matching this installer, so a CDN cache can
 # never mix files from two releases. Fall back to @main if the tag is missing.
 PKG_URL="${HERMES_PKG_URL:-https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@v$VERSION}"
