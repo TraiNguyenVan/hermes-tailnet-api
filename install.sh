@@ -1,8 +1,7 @@
 #!/bin/sh
 # hermes-tailnet-api — one-shot installer.
 #
-# (jsDelivr, not raw.githubusercontent — raw serves stale bytes for minutes)
-#   curl -fsSL https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.0.6/install.sh | sh
 #   ./install.sh                      (from a clone or unpacked copy)
 #
 # Env: HERMES_API_BASE, HERMES_API_KEY (both else prompted),
@@ -11,11 +10,12 @@ set -eu
 
 NAME=hermes-tailnet-api
 DEST="${HERMES_SKILL_DIR:-$HOME/.agents/skills/$NAME}"
-VERSION="1.0.5"
-# Fetch payload from the immutable tag matching this installer, so a CDN cache can
-# never mix files from two releases. Fall back to @main if the tag is missing.
-PKG_URL="${HERMES_PKG_URL:-https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@v$VERSION}"
-FALLBACK_URL="https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@main"
+VERSION="1.0.6"
+# Payload comes from the immutable tag matching THIS installer, from two CDNs.
+# Never fall back to a branch ref: @main serves stale, per-file, mixed versions
+# for minutes to hours, which silently installs a mismatched skill.
+PKG_URL="${HERMES_PKG_URL:-https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v$VERSION}"
+FALLBACK_URL="https://cdn.jsdelivr.net/gh/TraiNguyenVan/hermes-tailnet-api@v$VERSION"
 
 FILE_DIR=""
 for cand in "$(dirname "$0")" "."; do
@@ -41,9 +41,17 @@ fetch references/api.md "$DEST/references/api.md"
 fetch scripts/hermes-api "$DEST/scripts/hermes-api"
 fetch scripts/setup.sh "$DEST/scripts/setup.sh"
 chmod +x "$DEST/scripts/hermes-api" "$DEST/scripts/setup.sh"
+
+# Self-check: never finish on a mixed-version install.
+if ! grep -q "^version: $VERSION" "$DEST/SKILL.md" \
+   || ! grep -q "__version__ = \"$VERSION\"" "$DEST/scripts/hermes-api"; then
+  echo "ERROR: installed files are not version $VERSION" >&2
+  echo "  SKILL.md says: $(grep -m1 '^version:' "$DEST/SKILL.md" || echo '?')" >&2
+  exit 1
+fi
 echo "installed skill v$VERSION -> $DEST"
 
 "$DEST/scripts/setup.sh"
 echo
 echo "done. Restart your agent so it picks up ~/.agents/skills/$NAME."
-echo "upgrade later:  npx skills update hermes-tailnet-api -g -y   (or re-run this installer)"
+echo "upgrade later:  npx skills update $NAME -g -y   (or re-run this installer)"
