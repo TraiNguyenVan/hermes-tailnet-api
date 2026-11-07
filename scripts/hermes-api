@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""hermes-api — thin CLI for the Hermes gateway API server.
+
+Lets a coding agent (Claude Code, Codex, OpenCode, any shell) drive Hermes over
+the tailnet without knowing the HTTP details.
+
+  hermes-api ask  "do X"                 # synchronous completion, prints the answer
+  hermes-api run  "do X"                 # async run, prints run_id immediately
+  hermes-api wait RUN_ID                 # poll until finished, print output
+  hermes-api get  RUN_ID                 # one status snapshot (JSON)
+  hermes-api events RUN_ID               # stream live events (SSE)
+  hermes-api steer RUN_ID "change course"
+  hermes-api stop RUN_ID
+  hermes-api models
+  hermes-api version                  # CLI version + configured base
+
+Env:
+  HERMES_API_BASE   required, e.g. http://<host>:<port>/v1  (see setup.sh)
+  HERMES_API_KEY    default: API_SERVER_KEY from $HERMES_HOME/.env
+  HERMES_API_MODEL  default hermes-agent  (or p/<profile> routing via --profile)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE = os.environ.get("HERMES_API_BASE", "")
+__version__ = "1.0.0"
+DEFAULT_MODEL = os.environ.get("HERMES_API_MODEL", "hermes-agent")
+
+
+ENV_CANDIDATES = (
+    "~/.config/hermes/api.env",          # written by install.sh
+    "$HERMES_HOME/.env",                 # gateway host
+    "~/.hermes/.env",
+)
+
+
+def _read_env_file(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        with open(os.path.expandvars(os.path.expanduser(path)), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                out[name.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+_CONFIG: dict[str, str] | None = None
+
+
+def config() -> dict[str, str]:
+    """Env wins over files, so an exported key still overrides the on-disk one."""
+    global _CONFIG
+    if _CONFIG is None:
+        merged: dict[str, str] = {}
+        for path in ENV_CANDIDATES:
+            merged.update(_read_env_file(path))
+        merged.update({k: v for k, v in os.environ.items() if k.startswith("HERMES_API")})
+        _CONFIG = merged
+    return _CONFIG
+
+
+def api_key() -> str:
+    cfg = config()
+    for name in ("HERMES_API_KEY", "API_SERVER_KEY"):
+        if cfg.get(name):
+            return cfg[name].strip()
+    sys.exit(
+        "hermes-api: no API key. Run install.sh again, or export HERMES_API_KEY.\n"
+        "Looked for: " + ", ".join(ENV_CANDIDATES))
+
+
+def base_url() -> str:
+    base = (config().get("HERMES_API_BASE") or DEFAULT_BASE).rstrip("/")
+    if not base:
+        sys.exit("hermes-api: no server URL configured. Run scripts/setup.sh, or set "
+                 "HERMES_API_BASE in ~/.config/hermes/api.env (e.g. http://host:8642/v1).")
+    return base
+
+
+def call(method: str, path: str, body: dict | None = None, stream: bool = False,
+         timeout: float = 900.0):
+    url = base_url() + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {api_key()}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "text/event-stream" if stream else "application/json")
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:  # surface the server's message, not a traceback
+        detail = exc.read().decode("utf-8", "replace")[:1000]
+        sys.exit(f"hermes-api: HTTP {exc.code} — {detail}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"hermes-api: cannot reach {url} — {exc.reason}")
+    return resp
+
+
+def jbody(resp) -> dict:
+    return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def cmd_ask(args: list[str]) -> None:
+    prompt, session, model = parse_run_args(args)
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False}
+    msg = jbody(call("POST", "/chat/completions", body))["choices"][0]["message"]["content"]
+    print(msg)
+
+
+def parse_run_args(args: list[str]) -> tuple[str, str | None, str]:
+    session = None
+    model = DEFAULT_MODEL
+    rest = list(args)
+    if "--session" in rest:
+        i = rest.index("--session")
+        session = rest[i + 1]
+        del rest[i:i + 2]
+    if "--model" in rest:
+        i = rest.index("--model")
+        model = rest[i + 1]
+        del rest[i:i + 2]
+    if "--profile" in rest:
+        i = rest.index("--profile")
+        model = f"p/{rest[i + 1]}/{DEFAULT_MODEL}"
+        del rest[i:i + 2]
+    if not rest:
+        sys.exit("hermes-api: missing prompt")
+    return " ".join(rest), session, model
+
+
+def cmd_run(args: list[str]) -> None:
+    prompt, session, model = parse_run_args(args)
+    body: dict = {"input": prompt, "model": model}
+    if session:
+        body["session_id"] = session
+    out = jbody(call("POST", "/runs", body))
+    run_id = out.get("run_id") or out.get("id")
+    print(run_id)
+
+
+def cmd_get(run_id: str) -> None:
+    print(json.dumps(jbody(call("GET", f"/runs/{run_id}")), indent=2)[:4000])
+
+
+def cmd_wait(run_id: str, timeout_s: float = 900.0) -> None:
+    deadline = time.time() + timeout_s
+    while True:
+        snap = jbody(call("GET", f"/runs/{run_id}"))
+        status = str(snap.get("status", "")).lower()
+        if status in {"succeeded", "success", "completed", "done", "failed", "error", "cancelled", "stopped"}:
+            out = snap.get("output") or snap.get("result") or snap.get("response") or ""
+            if isinstance(out, (dict, list)):
+                out = json.dumps(out)[:8000]
+            print(f"[{status}] {out}")
+            sys.exit(0 if status.startswith(("succ", "comp", "done")) else 1)
+        if time.time() > deadline:
+            sys.exit(f"hermes-api: timed out waiting on {run_id} (status={status})")
+        time.sleep(2)
+
+
+def cmd_events(run_id: str) -> None:
+    resp = call("GET", f"/runs/{run_id}/events", stream=True)
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").rstrip("\n")
+        if line.startswith("data: "):
+            print(line[6:])
+
+
+def cmd_steer(run_id: str, message: str) -> None:
+    print(json.dumps(jbody(call("POST", f"/runs/{run_id}/steer", {"message": message})), indent=2)[:2000])
+
+
+def cmd_stop(run_id: str) -> None:
+    print(json.dumps(jbody(call("POST", f"/runs/{run_id}/stop", {})), indent=2)[:2000])
+
+
+def cmd_version() -> None:
+    print(f"hermes-api {__version__}")
+    print(f"base {base_url()}")
+
+
+def cmd_models() -> None:
+    print(json.dumps(jbody(call("GET", "/models")), indent=2)[:2000])
+
+
+USAGE = __doc__
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) < 2 or argv[1] in {"-h", "--help", "help"}:
+        print(USAGE)
+        return
+    verb, args = argv[1], argv[2:]
+    if verb == "ask":
+        cmd_ask(args)
+    elif verb == "run":
+        cmd_run(args)
+    elif verb == "wait":
+        cmd_wait(args[0])
+    elif verb == "get":
+        cmd_get(args[0])
+    elif verb == "events":
+        cmd_events(args[0])
+    elif verb == "steer":
+        cmd_steer(args[0], " ".join(args[1:]))
+    elif verb == "stop":
+        cmd_stop(args[0])
+    elif verb == "models":
+        cmd_models()
+    elif verb == "version":
+        cmd_version()
+    else:
+        sys.exit(f"hermes-api: unknown verb {verb!r}\n\n{USAGE}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
