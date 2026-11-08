@@ -14,6 +14,7 @@ Basic:
   hermes-api steer RUN_ID "change course"
   hermes-api approve RUN_ID [allow|deny] # resolve pending tool approval
   hermes-api stop RUN_ID
+  hermes-api fork SESSION_ID             # branch an existing session into writable API session
   hermes-api runs                        # list runs (checks capability)
   hermes-api sessions                    # list active conversation sessions
   hermes-api tools                       # list available remote toolsets
@@ -27,6 +28,7 @@ Attachments & Input:
   -i, --image PATH      Attach an image file (auto-encoded to base64 data URL)
   --extract-media [DIR] Extract returned image artifacts to local files
   --stop-on-interrupt   On Ctrl-C in wait, automatically stop the remote run
+  --fork                Auto-fork session if direct continuation is denied
   -                     Read prompt / diff from stdin (pipe-friendly)
 
 Examples:
@@ -35,6 +37,8 @@ Examples:
   hermes-api run -i diagram.png "explain architecture in diagram"
   hermes-api wait <run_id> --extract-media ./downloads
   hermes-api sessions
+  hermes-api fork 20261107_160243_319f5d
+  hermes-api run --session <desktop-session-id> --fork "continue this discussion"
 
 Env:
   HERMES_API_BASE   required, e.g. http://<host>:<port>/v1  (see setup.sh)
@@ -55,7 +59,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_BASE = os.environ.get("HERMES_API_BASE", "")
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 DEFAULT_MODEL = os.environ.get("HERMES_API_MODEL", "hermes-agent")
 
 MAX_TEXT_ATTACHMENT_BYTES = 25 * 1024 * 1024   # 25 MB
@@ -125,7 +129,7 @@ def server_root_url() -> str:
 
 
 def call(method: str, path: str, body: dict | None = None, stream: bool = False,
-         timeout: float = 900.0):
+         timeout: float = 900.0, raw_error: bool = False):
     if path.startswith(("/health/detailed", "/api/")):
         url = server_root_url() + path
     else:
@@ -138,6 +142,8 @@ def call(method: str, path: str, body: dict | None = None, stream: bool = False,
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
+        if raw_error:
+            raise
         detail = exc.read().decode("utf-8", "replace")[:1000]
         sys.exit(f"hermes-api: HTTP {exc.code} — {detail}")
     except urllib.error.URLError as exc:
@@ -147,6 +153,39 @@ def call(method: str, path: str, body: dict | None = None, stream: bool = False,
 
 def jbody(resp) -> dict:
     return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def get_session_source(session_id: str) -> str | None:
+    try:
+        data = jbody(call("GET", f"/api/sessions/{session_id}", raw_error=True))
+        return data.get("session", {}).get("source")
+    except Exception:
+        return None
+
+
+def fork_session(source_session_id: str, title: str | None = None) -> str:
+    body: dict = {}
+    if title:
+        body["title"] = title
+    try:
+        res = jbody(call("POST", f"/api/sessions/{source_session_id}/fork", body=body, raw_error=True))
+        fork_id = res.get("session", {}).get("id")
+        return fork_id
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:1000]
+        sys.exit(f"hermes-api: failed to fork session {source_session_id}: HTTP {exc.code} — {detail}")
+
+
+def format_session_permission_denied_msg(session_id: str, source: str | None = None) -> str:
+    src_str = f"'{source}'" if source else "a non-API client (e.g. desktop/TUI)"
+    return (
+        f"hermes-api: permission_denied for session '{session_id}'.\n"
+        f"Server policy restricts direct turn submission to sessions owned by {src_str}.\n"
+        f"To continue this conversation from the API client, fork it into a writable session:\n"
+        f"  hermes-api fork {session_id}\n"
+        f"Or automatically fork and run:\n"
+        f"  hermes-api run --session {session_id} --fork \"your prompt\""
+    )
 
 
 def encode_image_file(path: str) -> str:
@@ -224,11 +263,12 @@ def extract_media_from_text(text: str, output_dir: str = ".") -> list[str]:
     return saved
 
 
-def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dict], list[str], bool, str | None, bool]:
+def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dict], list[str], bool, str | None, bool, bool]:
     session = None
     model = DEFAULT_MODEL
     stream = False
     stop_on_interrupt = False
+    auto_fork = False
     extract_media: str | None = None
     files: list[dict] = []
     images: list[str] = []
@@ -256,6 +296,9 @@ def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dic
                 i += 1
         elif arg == "--stop-on-interrupt":
             stop_on_interrupt = True
+            i += 1
+        elif arg == "--fork":
+            auto_fork = True
             i += 1
         elif arg == "--session":
             if i + 1 >= len(args):
@@ -287,17 +330,17 @@ def parse_extended_args(args: list[str]) -> tuple[str, str | None, str, list[dic
     if not prompt and not files and not images:
         sys.exit("hermes-api: missing prompt or attachment")
 
-    return prompt, session, model, files, images, stream, extract_media, stop_on_interrupt
+    return prompt, session, model, files, images, stream, extract_media, stop_on_interrupt, auto_fork
 
 
 def parse_run_args(args: list[str]) -> tuple[str, str | None, str]:
-    prompt, session, model, files, images, _, _, _ = parse_extended_args(args)
+    prompt, session, model, files, images, _, _, _, _ = parse_extended_args(args)
     combined = build_combined_user_message(prompt, files, images)
     return combined, session, model
 
 
 def cmd_ask(args: list[str]) -> None:
-    prompt, session, model, files, images, stream, extract_media, _ = parse_extended_args(args)
+    prompt, session, model, files, images, stream, extract_media, _, auto_fork = parse_extended_args(args)
     full_prompt = build_combined_user_message(prompt, files, images)
 
     if images and not files:
@@ -349,14 +392,38 @@ def cmd_ask(args: list[str]) -> None:
 
 
 def cmd_run(args: list[str]) -> None:
-    prompt, session, model, files, images, _, _, _ = parse_extended_args(args)
+    prompt, session, model, files, images, _, _, _, auto_fork = parse_extended_args(args)
     combined = build_combined_user_message(prompt, files, images)
+    effective_session = session
+
+    if effective_session and auto_fork:
+        effective_session = fork_session(effective_session)
+        print(f"[forked to writable session: {effective_session}]", file=sys.stderr)
+
     body: dict = {"input": combined, "model": model}
-    if session:
-        body["session_id"] = session
-    out = jbody(call("POST", "/runs", body))
+    if effective_session:
+        body["session_id"] = effective_session
+
+    try:
+        out = jbody(call("POST", "/runs", body, raw_error=True))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        if exc.code == 409 and "permission_denied" in detail and effective_session:
+            source = get_session_source(effective_session)
+            sys.exit(format_session_permission_denied_msg(effective_session, source))
+        sys.exit(f"hermes-api: HTTP {exc.code} — {detail[:1000]}")
+
     run_id = out.get("run_id") or out.get("id")
     print(run_id)
+
+
+def cmd_fork(args: list[str]) -> None:
+    if not args:
+        sys.exit("hermes-api: missing SESSION_ID\nUsage: hermes-api fork SESSION_ID [TITLE]")
+    session_id = args[0]
+    title = " ".join(args[1:]) if len(args) > 1 else None
+    forked_id = fork_session(session_id, title=title)
+    print(forked_id)
 
 
 def cmd_get(run_id: str) -> None:
@@ -472,16 +539,17 @@ def cmd_sessions() -> None:
     if not data:
         print("No active sessions found.")
         return
-    print(f"{'Session ID':<26} {'Msgs':<6} {'Last Active':<18} {'Title / Preview':<40}")
-    print("-" * 92)
+    print(f"{'Session ID':<26} {'Source':<12} {'Msgs':<6} {'Last Active':<18} {'Title / Preview':<35}")
+    print("-" * 102)
     for s in data:
         sid = s.get("id", "")
+        src = s.get("source", "-")
         msgs = s.get("message_count", 0)
         la = s.get("last_active")
         la_str = datetime.datetime.fromtimestamp(la).strftime("%Y-%m-%d %H:%M") if la else "-"
         title = s.get("title") or s.get("preview") or "-"
-        clean_title = title.replace("\n", " ").strip()[:38]
-        print(f"{sid:<26} {msgs:<6} {la_str:<18} {clean_title:<40}")
+        clean_title = title.replace("\n", " ").strip()[:33]
+        print(f"{sid:<26} {src:<12} {msgs:<6} {la_str:<18} {clean_title:<35}")
 
 
 def cmd_capabilities() -> None:
@@ -544,6 +612,8 @@ def main(argv: list[str]) -> None:
         cmd_ask(args)
     elif verb == "run":
         cmd_run(args)
+    elif verb == "fork":
+        cmd_fork(args)
     elif verb == "wait":
         cmd_wait(args)
     elif verb == "get":

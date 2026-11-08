@@ -17,7 +17,7 @@ npx skills add TraiNguyenVan/hermes-tailnet-api -g -a '*' -y
 or without node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.2.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/TraiNguyenVan/hermes-tailnet-api/v1.3.0/install.sh | sh
 ```
 
 `setup.sh` prompts for the server URL and the API key, writes

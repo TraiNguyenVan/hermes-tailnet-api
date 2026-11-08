@@ -14,7 +14,7 @@ loader.exec_module(hermes_api)
 
 class TestHermesAPI(unittest.TestCase):
     def test_parse_extended_args_simple(self):
-        prompt, session, model, files, images, stream, extract_media, stop_on_interrupt = hermes_api.parse_extended_args(["do", "something"])
+        prompt, session, model, files, images, stream, extract_media, stop_on_interrupt, auto_fork = hermes_api.parse_extended_args(["do", "something"])
         self.assertEqual(prompt, "do something")
         self.assertIsNone(session)
         self.assertEqual(model, "hermes-agent")
@@ -23,20 +23,22 @@ class TestHermesAPI(unittest.TestCase):
         self.assertFalse(stream)
         self.assertIsNone(extract_media)
         self.assertFalse(stop_on_interrupt)
+        self.assertFalse(auto_fork)
 
     def test_parse_extended_args_with_files_and_stream(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write("test content\nline 2")
             tf_path = tf.name
         try:
-            prompt, session, model, files, images, stream, extract_media, stop_on_interrupt = hermes_api.parse_extended_args([
-                "review", "-f", tf_path, "--stream", "--session", "sess_1", "--extract-media", "/tmp/out", "--stop-on-interrupt"
+            prompt, session, model, files, images, stream, extract_media, stop_on_interrupt, auto_fork = hermes_api.parse_extended_args([
+                "review", "-f", tf_path, "--stream", "--session", "sess_1", "--extract-media", "/tmp/out", "--stop-on-interrupt", "--fork"
             ])
             self.assertEqual(prompt, "review")
             self.assertEqual(session, "sess_1")
             self.assertTrue(stream)
             self.assertEqual(extract_media, "/tmp/out")
             self.assertTrue(stop_on_interrupt)
+            self.assertTrue(auto_fork)
             self.assertEqual(len(files), 1)
             self.assertEqual(files[0]["content"], "test content\nline 2")
         finally:
@@ -87,6 +89,13 @@ class TestHermesAPI(unittest.TestCase):
     def test_read_text_attachment_rejects_missing(self):
         with self.assertRaises(SystemExit):
             hermes_api.read_text_attachment("/nonexistent/file/path.txt")
+
+    def test_format_permission_denied_help(self):
+        msg = hermes_api.format_session_permission_denied_msg("sess_123", "desktop")
+        self.assertIn("sess_123", msg)
+        self.assertIn("desktop", msg)
+        self.assertIn("hermes-api fork sess_123", msg)
+        self.assertIn("--fork", msg)
 
 if __name__ == "__main__":
     unittest.main()
